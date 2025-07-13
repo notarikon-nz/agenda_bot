@@ -18,7 +18,7 @@ Requirements:
 - OBS with websocket plugin enabled
 - Stream Deck with HTTP request capability
 
-Author: Assistant
+Author: Matt Orsborn
 License: MIT
 """
 
