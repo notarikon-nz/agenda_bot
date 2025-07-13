@@ -260,38 +260,43 @@ class DatabaseManager:
                 ''')
                 processed_stats = cursor.fetchone()
                 
-                # Get actual processed totals from queue_items (for verification)
+                # Get actual processed totals EXCLUDING reset items
+                # Only count items processed AFTER the last reset
                 cursor = conn.execute('''
                     SELECT 
                         COUNT(*) as actual_processed_count,
                         COALESCE(SUM(amount), 0) as actual_processed_amount
                     FROM queue_items
-                    WHERE processed = TRUE
+                    WHERE processed = TRUE 
+                    AND timestamp NOT LIKE '%[RESET:%'
                 ''')
                 actual_processed = cursor.fetchone()
                 
                 stats_processed_count = processed_stats[0] if processed_stats else 0
                 stats_processed_amount = processed_stats[1] if processed_stats else 0.0
                 
-                # Check if stats table is out of sync with actual data
+                # Check if stats table is out of sync with actual data (excluding reset items)
                 if (actual_processed[0] != stats_processed_count or 
                     abs(actual_processed[1] - stats_processed_amount) > 0.01):
                     
-                    logger.warning(f"Stats table out of sync. Actual: {actual_processed[0]} items, ${actual_processed[1]:.2f}. Stats table: {stats_processed_count} items, ${stats_processed_amount:.2f}")
+                    logger.warning(f"Stats table out of sync. Actual (post-reset): {actual_processed[0]} items, ${actual_processed[1]:.2f}. Stats table: {stats_processed_count} items, ${stats_processed_amount:.2f}")
                     
-                    # Auto-repair the stats table
-                    conn.execute('''
-                        UPDATE queue_stats
-                        SET total_processed = ?,
-                            total_amount = ?,
-                            last_updated = CURRENT_TIMESTAMP
-                        WHERE id = 1
-                    ''', (actual_processed[0], actual_processed[1]))
-                    conn.commit()
-                    
-                    logger.info(f"Auto-repaired stats table with actual values")
-                    stats_processed_count = actual_processed[0]
-                    stats_processed_amount = actual_processed[1]
+                    # Only auto-repair if stats are higher than actual (prevent going backwards after reset)
+                    if stats_processed_count < actual_processed[0] or stats_processed_amount < actual_processed[1]:
+                        logger.info("Auto-repairing stats table with current post-reset values")
+                        conn.execute('''
+                            UPDATE queue_stats
+                            SET total_processed = ?,
+                                total_amount = ?,
+                                last_updated = CURRENT_TIMESTAMP
+                            WHERE id = 1
+                        ''', (actual_processed[0], actual_processed[1]))
+                        conn.commit()
+                        
+                        stats_processed_count = actual_processed[0]
+                        stats_processed_amount = actual_processed[1]
+                    else:
+                        logger.info("Not auto-repairing stats - would decrease values (likely after reset)")
                 
                 return {
                     'total_in_queue': pending_stats[0],
@@ -305,6 +310,146 @@ class DatabaseManager:
             return {'total_in_queue': 0, 'total_amount_pending': 0.0, 'total_processed': 0, 'total_amount_processed': 0.0}
     
     def repair_stats_table(self) -> bool:
+        """Manually repair the stats table by recalculating from queue_items"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Calculate actual totals from queue_items
+                cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as total_processed,
+                        COALESCE(SUM(amount), 0) as total_amount
+                    FROM queue_items
+                    WHERE processed = TRUE
+                ''')
+                actual_totals = cursor.fetchone()
+                
+                # Update stats table with correct values
+                conn.execute('''
+                    UPDATE queue_stats
+                    SET total_processed = ?,
+                        total_amount = ?,
+                        last_updated = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                ''', (actual_totals[0], actual_totals[1]))
+                
+                conn.commit()
+                
+                logger.info(f"Stats table repaired: {actual_totals[0]} processed items, ${actual_totals[1]:.2f} total amount")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error repairing stats table: {e}")
+            return False
+
+    def reset_queue_counter(self) -> Tuple[bool, Dict]:
+        """Reset queue counter to zero while preserving all messages and stats"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Get current stats before reset
+                cursor = conn.execute('''
+                    SELECT total_processed, total_amount FROM queue_stats WHERE id = 1
+                ''')
+                current_stats = cursor.fetchone()
+                
+                if not current_stats:
+                    current_stats = (0, 0.0)
+                
+                # Count items that will be affected by reset
+                cursor = conn.execute('''
+                    SELECT COUNT(*), COALESCE(SUM(amount), 0)
+                    FROM queue_items 
+                    WHERE processed = TRUE
+                ''')
+                processed_counts = cursor.fetchone()
+                
+                cursor = conn.execute('''
+                    SELECT COUNT(*), COALESCE(SUM(amount), 0)
+                    FROM queue_items 
+                    WHERE processed = FALSE
+                ''')
+                pending_counts = cursor.fetchone()
+                
+                # Add a reset marker to all existing items for historical tracking
+                reset_timestamp = datetime.now().isoformat()
+                conn.execute('''
+                    UPDATE queue_items 
+                    SET timestamp = timestamp || ' [RESET:' || ? || ']'
+                    WHERE timestamp NOT LIKE '%[RESET:%'
+                ''', (reset_timestamp,))
+                
+                # Mark all pending items as processed (so they don't show in queue)
+                # but keep them in database for historical purposes
+                conn.execute('''
+                    UPDATE queue_items 
+                    SET processed = TRUE
+                    WHERE processed = FALSE
+                ''')
+                
+                # Reset the counter in stats table to zero
+                conn.execute('''
+                    UPDATE queue_stats
+                    SET total_processed = 0,
+                        total_amount = 0.0,
+                        last_updated = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                ''')
+                
+                conn.commit()
+                
+                reset_info = {
+                    "reset_timestamp": reset_timestamp,
+                    "items_archived": processed_counts[0] + pending_counts[0],
+                    "total_amount_archived": processed_counts[1] + pending_counts[1],
+                    "processed_items_archived": processed_counts[0],
+                    "pending_items_archived": pending_counts[0]
+                }
+                
+                logger.info(f"Queue counter reset: {reset_info['items_archived']} items archived, ${reset_info['total_amount_archived']:.2f} total")
+                return True, reset_info
+                
+        except Exception as e:
+            logger.error(f"Error resetting queue counter: {e}")
+            return False, {"error": str(e)}
+    
+    def get_queue_stats_after_reset(self) -> Dict:
+        """Get queue stats immediately after reset to ensure OBS shows 0/0"""
+        return {
+            'total_in_queue': 0,
+            'total_amount_pending': 0.0, 
+            'total_processed': 0,
+            'total_amount_processed': 0.0
+        }
+    
+    def get_reset_history(self) -> List[Dict]:
+        """Get history of queue resets"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as items_count,
+                        COALESCE(SUM(amount), 0) as total_amount,
+                        substr(timestamp, instr(timestamp, '[RESET:') + 7, 19) as reset_time
+                    FROM queue_items 
+                    WHERE timestamp LIKE '%[RESET:%'
+                    GROUP BY reset_time
+                    ORDER BY reset_time DESC
+                    LIMIT 10
+                ''')
+                
+                resets = []
+                for row in cursor.fetchall():
+                    reset_time = row[2].replace(']', '') if row[2] else 'Unknown'
+                    resets.append({
+                        "reset_time": reset_time,
+                        "items_archived": row[0],
+                        "total_amount": row[1]
+                    })
+                
+                return resets
+                
+        except Exception as e:
+            logger.error(f"Error getting reset history: {e}")
+            return []
         """Manually repair the stats table by recalculating from queue_items"""
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -1285,8 +1430,8 @@ class OBSManager:
             success = False
             
             # Try WebSocket v5 (OBS 28+) method first
-            # if self._is_websocket_v5_or_newer():
-            success = self._update_text_v5(source_name, text_content)
+            if self._is_websocket_v5_or_newer():
+                success = self._update_text_v5(source_name, text_content)
             
             # Fallback to legacy method if v5 fails or not detected
             if not success:
@@ -1550,7 +1695,68 @@ class TTSQueueSystem:
             except Exception as e:
                 logger.error(f"Add donation error: {e}")
                 return jsonify({'status': 'error', 'message': str(e)}), 500
+
+        @self.app.route('/skip_next', methods=['POST'])
+        def skip_next():
+            """Skip the next item in queue (moderation)"""
+            try:
+                with self.processing_lock:
+                    success, result = self.db.skip_current_item()
+                    
+                    if success:
+                        self.update_displays()
+                        return jsonify({
+                            'status': 'success', 
+                            'message': 'Item skipped',
+                            **result
+                        })
+                    else:
+                        return jsonify({
+                            'status': 'error',
+                            'message': result.get('error', 'Failed to skip item')
+                        }), 400
+                        
+            except Exception as e:
+                logger.error(f"Skip next error: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
         
+        @self.app.route('/reset_counter', methods=['POST'])
+        def reset_counter():
+            """Reset queue counter to zero (keeps all data for history)"""
+            try:
+                success, result = self.reset_queue_counter()
+                
+                if success:
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'Queue counter reset successfully - OBS should now show 0/0',
+                        **result
+                    })
+                else:
+                    return jsonify({
+                        'status': 'error',
+                        'message': result.get('error', 'Failed to reset counter')
+                    }), 500
+                    
+            except Exception as e:
+                logger.error(f"Reset counter error: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
+        
+ 
+        @self.app.route('/api/reset-history', methods=['GET'])
+        def get_reset_history():
+            """Get history of queue resets"""
+            try:
+                history = self.db.get_reset_history()
+                return jsonify({
+                    'status': 'success',
+                    'reset_history': history
+                })
+            except Exception as e:
+                logger.error(f"Reset history error: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
+      
+
         @self.app.route('/repair', methods=['POST'])
         def repair_database():
             """Repair database stats"""
@@ -1632,14 +1838,52 @@ class TTSQueueSystem:
                 logger.error(f"Error processing item: {e}")
                 return False
     
-    def update_displays(self):
+    def update_displays(self, force_stats=None):
         """Update OBS and other displays"""
         try:
-            stats = self.db.get_queue_stats()
-            self.obs.update_queue_display(stats)
+            # Use forced stats if provided (e.g., after reset), otherwise get current stats
+            if force_stats:
+                stats = force_stats
+                logger.debug(f"Using forced stats for display update: {stats}")
+            else:
+                stats = self.db.get_queue_stats()
+                logger.debug(f"Retrieved current stats for display update: {stats}")
+            
+            success = self.obs.update_queue_display(stats)
+            
+            if success:
+                logger.info(f"Display updated successfully: Queue: {stats['total_processed']}/{stats['total_processed'] + stats['total_in_queue']}")
+            else:
+                logger.warning("Display update failed")
+                
         except Exception as e:
             logger.error(f"Error updating displays: {e}")
     
+    def reset_queue_counter(self):
+        """Reset queue counter and update displays to show 0/0"""
+        try:
+            success, result = self.db.reset_queue_counter()
+            
+            if success:
+                # Force displays to show 0/0 immediately
+                zero_stats = {
+                    'total_in_queue': 0,
+                    'total_amount_pending': 0.0,
+                    'total_processed': 0,
+                    'total_amount_processed': 0.0
+                }
+                
+                self.update_displays(force_stats=zero_stats)
+                logger.info("Queue counter reset and displays updated to 0/0")
+                return True, result
+            else:
+                return False, result
+                
+        except Exception as e:
+            logger.error(f"Error in reset_queue_counter: {e}")
+            return False, {"error": str(e)}
+    
+
     def run_server(self):
         """Run the Flask server"""
         try:
