@@ -1,2 +1,8 @@
 config.json
 old_tts_queue.py
+tts_queue.db
+tts_queue.log
+__pycache__
+tts_cache/
+*.pyc
+dashboard.py

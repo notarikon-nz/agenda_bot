@@ -1,10 +1,26 @@
 # TTS Donation Queue Setup Instructions
 
+## System Overview
+
+A professional TTS donation queue system featuring:
+
+- Multiple TTS providers from basic to premium quality
+- Stream Deck integration for seamless control
+- OBS integration with live queue display
+- Discord webhook support for chat notifications
+- Smart tier system for different donation levels
+- Automatic failover between TTS services
+
 ## Prerequisites
 
 ### 1. Install Required Python Packages
 ```bash
-pip install obswebsocket-python discord-webhook gtts pygame flask requests
+pip install obswebsocket-python discord-webhook flask requests pygame sqlite3
+```
+
+Enhanced TTS (FREE upgrade - highly recommended!)
+```bash
+pip install edge-tts asyncio aiohttp
 ```
 
 ### 2. OBS Setup
@@ -74,7 +90,7 @@ Make sure your system audio is working and pygame can play sounds. The system us
 
 ### 1. Start the System
 ```bash
-python3 tts_queue_system.py
+python3 tts_queue.py
 ```
 
 ### 2. Add Donations (For Testing)
@@ -150,6 +166,10 @@ You can create multiple Stream Deck buttons for different functions:
    - Verify pygame mixer initialization
    - Test with a simple audio file
 
+```bash
+python3 -c "import pygame; pygame.mixer.init(); print('Audio OK')"
+```
+
 2. **OBS not updating**:
    - Verify OBS WebSocket is enabled
    - Check the text source name matches config
@@ -187,13 +207,12 @@ def custom_function():
 ```
 
 ### Modifying TTS Voice
-Edit the TTS configuration in config.json:
-- Change language (e.g., "en-gb", "en-au")
-- Adjust speed with "slow": true
-- Modify volume (0.0 to 1.0)
+Edit the TTS configuration in tts_config.json:
+- Change voice (e.g., "en-US-MichelleNeural" or "en-AU-NatashaNeural")
+- Adjust rate and pitch if desired
 
 ### Custom OBS Updates
-You can modify the `update_queue_display` method to show different information or update multiple text sources.
+You can modify the `update_queue_display` method in the OBSManager class to show different information or update multiple text sources.
 
 ## Security Considerations
 

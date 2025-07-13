@@ -1,0 +1,83 @@
+{
+  "volume": 0.8,
+  "max_message_length": 500,
+  "cache_dir": "tts_cache",
+  "fallback_order": [
+    "edge_tts",
+    "azure_tts",
+    "elevenlabs",
+    "polly",
+    "coqui_tts",
+    "gtts"
+  ],
+  "tier_settings": {
+    "default": {
+      "provider": "edge_tts",
+      "voice": "en-US-AriaNeural",
+      "options": {
+        "rate": "+10%",
+        "pitch": "+0Hz"
+      }
+    },
+    "premium": {
+      "provider": "azure_tts",
+      "voice": "en-US-JennyNeural",
+      "options": {
+        "rate": "1.1",
+        "pitch": "1.0"
+      }
+    },
+    "vip": {
+      "provider": "elevenlabs",
+      "voice": "EXAVITQu4vr4xnSDxMaL",
+      "options": {
+        "stability": 0.6,
+        "similarity_boost": 0.9
+      }
+    }
+  },
+  "user_voices": {
+    "StreamerName": {
+      "provider": "elevenlabs",
+      "voice": "pNInz6obpgDQGcFmaJgB"
+    }
+  },
+  "providers": {
+    "edge_tts": {
+      "enabled": true,
+      "default_voice": "en-US-AriaNeural",
+      "rate": "+0%",
+      "pitch": "+0Hz"
+    },
+    "azure_tts": {
+      "enabled": false,
+      "api_key": "YOUR_AZURE_SPEECH_KEY",
+      "region": "eastus",
+      "default_voice": "en-US-AriaNeural"
+    },
+    "elevenlabs": {
+      "enabled": false,
+      "api_key": "YOUR_ELEVENLABS_API_KEY",
+      "default_voice": "EXAVITQu4vr4xnSDxMaL",
+      "stability": 0.5,
+      "similarity_boost": 0.8
+    },
+    "polly": {
+      "enabled": false,
+      "aws_access_key": "YOUR_AWS_ACCESS_KEY",
+      "aws_secret_key": "YOUR_AWS_SECRET_KEY",
+      "region": "us-east-1",
+      "default_voice": "Joanna",
+      "engine": "neural"
+    },
+    "gtts": {
+      "enabled": true,
+      "language": "en",
+      "slow": false
+    },
+    "coqui_tts": {
+      "enabled": false,
+      "model": "tts_models/en/ljspeech/tacotron2-DDC"
+    }
+  }
+}

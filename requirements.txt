@@ -4,3 +4,6 @@ gtts
 pygame 
 flask 
 requests
+edge-tts 
+asyncio 
+aiohttp
