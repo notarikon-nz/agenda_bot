@@ -1,0 +1,6 @@
+obs-websocket-py 
+discord-webhook 
+gtts 
+pygame 
+flask 
+requests
