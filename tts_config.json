@@ -1,4 +1,17 @@
 {
+  "audio_quality": {
+    "audio_backend": "auto",
+    "sample_rate": 22050,
+    "channels": 1,
+    "bit_depth": 16,
+    "normalize_audio": true,
+    "validate_audio": true,
+    "retry_on_static": true,
+    "max_retries": 3,
+    "min_duration": 0.5,
+    "max_silence_ratio": 0.8,
+    "static_threshold": 0.1
+  },
   "volume": 0.8,
   "max_message_length": 500,
   "cache_dir": "tts_cache",
@@ -46,6 +59,7 @@
     "edge_tts": {
       "enabled": true,
       "default_voice": "en-US-AriaNeural",
+      "use_ssml": false,
       "rate": "+0%",
       "pitch": "+0Hz"
     },

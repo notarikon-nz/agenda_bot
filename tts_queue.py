@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Configure logging for debugging and monitoring
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler('tts_queue.log'),
         logging.StreamHandler()
@@ -203,20 +203,39 @@ class DatabaseManager:
             return None
     
     def mark_processed(self, item_id: int) -> bool:
-        """Mark item as processed"""
+        """Mark item as processed and update totals"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                # First get the amount for this item
+                cursor = conn.execute('''
+                    SELECT amount FROM queue_items WHERE id = ?
+                ''', (item_id,))
+                result = cursor.fetchone()
+                
+                if not result:
+                    logger.error(f"Item with id {item_id} not found")
+                    return False
+                
+                item_amount = result[0]
+                
+                # Mark item as processed
                 conn.execute('''
                     UPDATE queue_items SET processed = TRUE WHERE id = ?
                 ''', (item_id,))
+                
+                # Update stats with both count and amount
                 conn.execute('''
                     UPDATE queue_stats
                     SET total_processed = total_processed + 1,
+                        total_amount = total_amount + ?,
                         last_updated = CURRENT_TIMESTAMP
                     WHERE id = 1
-                ''')
+                ''', (item_amount,))
+                
                 conn.commit()
+                logger.debug(f"Marked item {item_id} as processed, added ${item_amount:.2f} to total")
                 return True
+                
         except Exception as e:
             logger.error(f"Error marking processed: {e}")
             return False
@@ -241,15 +260,81 @@ class DatabaseManager:
                 ''')
                 processed_stats = cursor.fetchone()
                 
+                # Get actual processed totals from queue_items (for verification)
+                cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as actual_processed_count,
+                        COALESCE(SUM(amount), 0) as actual_processed_amount
+                    FROM queue_items
+                    WHERE processed = TRUE
+                ''')
+                actual_processed = cursor.fetchone()
+                
+                stats_processed_count = processed_stats[0] if processed_stats else 0
+                stats_processed_amount = processed_stats[1] if processed_stats else 0.0
+                
+                # Check if stats table is out of sync with actual data
+                if (actual_processed[0] != stats_processed_count or 
+                    abs(actual_processed[1] - stats_processed_amount) > 0.01):
+                    
+                    logger.warning(f"Stats table out of sync. Actual: {actual_processed[0]} items, ${actual_processed[1]:.2f}. Stats table: {stats_processed_count} items, ${stats_processed_amount:.2f}")
+                    
+                    # Auto-repair the stats table
+                    conn.execute('''
+                        UPDATE queue_stats
+                        SET total_processed = ?,
+                            total_amount = ?,
+                            last_updated = CURRENT_TIMESTAMP
+                        WHERE id = 1
+                    ''', (actual_processed[0], actual_processed[1]))
+                    conn.commit()
+                    
+                    logger.info(f"Auto-repaired stats table with actual values")
+                    stats_processed_count = actual_processed[0]
+                    stats_processed_amount = actual_processed[1]
+                
                 return {
                     'total_in_queue': pending_stats[0],
                     'total_amount_pending': pending_stats[1],
-                    'total_processed': processed_stats[0] if processed_stats else 0,
-                    'total_amount_processed': processed_stats[1] if processed_stats else 0.0
+                    'total_processed': stats_processed_count,
+                    'total_amount_processed': stats_processed_amount
                 }
+                
         except Exception as e:
             logger.error(f"Error getting queue stats: {e}")
             return {'total_in_queue': 0, 'total_amount_pending': 0.0, 'total_processed': 0, 'total_amount_processed': 0.0}
+    
+    def repair_stats_table(self) -> bool:
+        """Manually repair the stats table by recalculating from queue_items"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Calculate actual totals from queue_items
+                cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as total_processed,
+                        COALESCE(SUM(amount), 0) as total_amount
+                    FROM queue_items
+                    WHERE processed = TRUE
+                ''')
+                actual_totals = cursor.fetchone()
+                
+                # Update stats table with correct values
+                conn.execute('''
+                    UPDATE queue_stats
+                    SET total_processed = ?,
+                        total_amount = ?,
+                        last_updated = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                ''', (actual_totals[0], actual_totals[1]))
+                
+                conn.commit()
+                
+                logger.info(f"Stats table repaired: {actual_totals[0]} processed items, ${actual_totals[1]:.2f} total amount")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error repairing stats table: {e}")
+            return False
 
 class TTSProvider(ABC):
     """Abstract base class for TTS providers"""
@@ -1043,6 +1128,8 @@ class OBSManager:
         self.config = config
         self.client = None
         self.connected = False
+        self.obs_version = None
+        self.websocket_version = None
         self.connect()
     
     def connect(self):
@@ -1055,10 +1142,133 @@ class OBSManager:
             )
             self.client.connect()
             self.connected = True
-            logger.info("Connected to OBS")
+            logger.info("Successfully connected to OBS WebSocket")
+            
+            # Get OBS and WebSocket version info with detailed error checking
+            try:
+                logger.debug("Attempting to get OBS version info...")
+                version_info = self.client.call(obswebsocket.requests.GetVersion())
+                logger.debug(f"GetVersion call successful, raw response: {version_info}")
+                
+                # Check if response has expected structure
+                if hasattr(version_info, 'datain'):
+                    logger.debug(f"Response has datain attribute: {version_info.datain}")
+                    
+                    # Try to get OBS version
+                    try:
+                        self.obs_version = version_info.datain.get('obsVersion', 'Unknown')
+                        logger.debug(f"Retrieved OBS version: {self.obs_version}")
+                    except Exception as e:
+                        logger.warning(f"Failed to get 'obsVersion' from datain: {e}")
+                        logger.debug(f"Available datain keys: {list(version_info.datain.keys()) if hasattr(version_info.datain, 'keys') else 'datain is not dict-like'}")
+                        self.obs_version = "Unknown"
+                    
+                    # Try to get WebSocket version
+                    try:
+                        self.websocket_version = version_info.datain.get('obsWebSocketVersion', 'Unknown')
+                        logger.debug(f"Retrieved WebSocket version: {self.websocket_version}")
+                    except Exception as e:
+                        logger.warning(f"Failed to get 'obsWebSocketVersion' from datain: {e}")
+                        self.websocket_version = "Unknown"
+                    
+                    # Log all available keys for debugging
+                    try:
+                        if hasattr(version_info.datain, 'keys'):
+                            available_keys = list(version_info.datain.keys())
+                            logger.info(f"Available version info keys: {available_keys}")
+                        else:
+                            logger.warning(f"datain is not dict-like, type: {type(version_info.datain)}")
+                    except Exception as e:
+                        logger.warning(f"Could not enumerate datain keys: {e}")
+                
+                else:
+                    logger.warning(f"GetVersion response missing 'datain' attribute. Response type: {type(version_info)}")
+                    logger.debug(f"Response attributes: {dir(version_info)}")
+                    
+                    # Try alternative attribute names
+                    for attr_name in ['data', 'responseData', 'result']:
+                        if hasattr(version_info, attr_name):
+                            logger.info(f"Found alternative data attribute: {attr_name}")
+                            try:
+                                alt_data = getattr(version_info, attr_name)
+                                logger.debug(f"Alternative data content: {alt_data}")
+                                if hasattr(alt_data, 'get'):
+                                    self.obs_version = alt_data.get('obsVersion', 'Unknown')
+                                    self.websocket_version = alt_data.get('obsWebSocketVersion', 'Unknown')
+                                    break
+                            except Exception as e:
+                                logger.debug(f"Failed to use alternative attribute {attr_name}: {e}")
+                    
+                    if self.obs_version is None:
+                        self.obs_version = "Unknown"
+                        self.websocket_version = "Unknown"
+                
+                logger.info(f"Connected to OBS {self.obs_version} with WebSocket v{self.websocket_version}")
+                
+            except AttributeError as e:
+                logger.error(f"GetVersion request not available in obswebsocket library: {e}")
+                logger.info("This might indicate an older obs-websocket-py version")
+                self.obs_version = "Unknown"
+                self.websocket_version = "Unknown"
+                
+                # Try manual version request
+                try:
+                    logger.debug("Attempting manual GetVersion request...")
+                    manual_response = self.client.call({
+                        "request-type": "GetVersion"
+                    })
+                    logger.debug(f"Manual GetVersion response: {manual_response}")
+                    
+                    if hasattr(manual_response, 'datain') and manual_response.datain:
+                        self.obs_version = manual_response.datain.get('obs-studio-version', 'Unknown')
+                        self.websocket_version = manual_response.datain.get('obs-websocket-version', 'Unknown')
+                        logger.info(f"Manual version retrieval successful: OBS {self.obs_version}, WebSocket v{self.websocket_version}")
+                    else:
+                        logger.warning("Manual GetVersion request also failed")
+                        
+                except Exception as manual_e:
+                    logger.error(f"Manual GetVersion request failed: {manual_e}")
+                
+            except Exception as e:
+                logger.error(f"Unexpected error getting OBS version info: {e}")
+                logger.debug(f"Error type: {type(e)}")
+                logger.debug(f"Error args: {e.args}")
+                self.obs_version = "Unknown"
+                self.websocket_version = "Unknown"
+            
         except Exception as e:
             logger.error(f"OBS connection error: {e}")
+            logger.debug(f"Connection error type: {type(e)}")
             self.connected = False
+
+    
+    def _is_websocket_v5_or_newer(self) -> bool:
+        """Check if using WebSocket protocol v5 or newer (OBS 28+)"""
+        if not self.websocket_version or self.websocket_version == "Unknown":
+            # Try to detect by attempting a v5 call
+            try:
+                # Try GetVersion which exists in both versions
+                version_info = self.client.call(obswebsocket.requests.GetVersion())
+                # Check if the response format indicates v5
+                if hasattr(version_info, 'datain') and 'rpcVersion' in version_info.datain:
+                    rpc_version = version_info.datain.get('rpcVersion', 0)
+                    return rpc_version >= 1  # v5 uses RPC version 1
+            except Exception:
+                pass
+            
+            # Fallback: assume v5 if version string suggests OBS 28+
+            if self.obs_version and "28." in self.obs_version:
+                return True
+            
+            return False
+        
+        # Parse version string
+        try:
+            version_parts = self.websocket_version.split('.')
+            major_version = int(version_parts[0])
+            return major_version >= 5
+        except (ValueError, IndexError):
+            return False
     
     def update_queue_display(self, stats: Dict):
         """Update OBS text source with queue information"""
@@ -1070,19 +1280,156 @@ class OBSManager:
         
         try:
             text_content = f"Queue: {stats['total_processed']}/{stats['total_processed'] + stats['total_in_queue']}"
+            source_name = self.config.get('obs.queue_text_source', 'TTS Queue Counter')
             
-            self.client.call(obswebsocket.requests.SetTextGDIPlusText(
-                source=self.config.get('obs.queue_text_source', 'TTS Queue Counter'),
-                text=text_content
-            ))
+            success = False
             
-            logger.info(f"Updated OBS display: {text_content}")
-            return True
+            # Try WebSocket v5 (OBS 28+) method first
+            # if self._is_websocket_v5_or_newer():
+            success = self._update_text_v5(source_name, text_content)
             
+            # Fallback to legacy method if v5 fails or not detected
+            if not success:
+                success = self._update_text_legacy(source_name, text_content)
+            
+            if success:
+                logger.info(f"Updated OBS display: {text_content}")
+                return True
+            else:
+                logger.error("All OBS update methods failed")
+                return False
+                
         except Exception as e:
             logger.error(f"OBS update error: {e}")
             self.connected = False
             return False
+    
+    def _update_text_v5(self, source_name: str, text_content: str) -> bool:
+        """Update text using WebSocket v5 (OBS 28+) SetInputSettings"""
+        try:
+            # WebSocket v5 uses SetInputSettings
+            request = obswebsocket.requests.SetInputSettings(
+                inputName=source_name,
+                inputSettings={
+                    "text": text_content
+                }
+            )
+            
+            response = self.client.call(request)
+            logger.debug(f"OBS v5 update successful: {response}")
+            return True
+            
+        except AttributeError:
+            # SetInputSettings might not be available in older obswebsocket-python
+            logger.debug("SetInputSettings not available, trying manual request")
+            try:
+                # Manual request for newer protocol
+                response = self.client.call({
+                    "request-type": "SetInputSettings", 
+                    "inputName": source_name,
+                    "inputSettings": {
+                        "text": text_content
+                    }
+                })
+                logger.debug(f"OBS v5 manual update successful: {response}")
+                return True
+            except Exception as e:
+                logger.debug(f"OBS v5 manual update failed: {e}")
+                return False
+                
+        except Exception as e:
+            logger.debug(f"OBS v5 update failed: {e}")
+            return False
+    
+    def _update_text_legacy(self, source_name: str, text_content: str) -> bool:
+        """Update text using legacy WebSocket (OBS 27 and earlier)"""
+        try:
+            # Try SetTextGDIPlusText first (most common)
+            try:
+                request = obswebsocket.requests.SetTextGDIPlusText(
+                    source=source_name,
+                    text=text_content
+                )
+                response = self.client.call(request)
+                logger.debug(f"OBS legacy SetTextGDIPlusText successful: {response}")
+                return True
+            except Exception as e:
+                logger.debug(f"SetTextGDIPlusText failed: {e}")
+            
+            # Try SetSourceSettings as fallback
+            try:
+                request = obswebsocket.requests.SetSourceSettings(
+                    sourceName=source_name,
+                    sourceSettings={
+                        "text": text_content
+                    }
+                )
+                response = self.client.call(request)
+                logger.debug(f"OBS legacy SetSourceSettings successful: {response}")
+                return True
+            except Exception as e:
+                logger.debug(f"SetSourceSettings failed: {e}")
+            
+            # Manual legacy request as last resort
+            try:
+                response = self.client.call({
+                    "request-type": "SetTextGDIPlusProperties",
+                    "source": source_name,
+                    "text": text_content
+                })
+                logger.debug(f"OBS legacy manual update successful: {response}")
+                return True
+            except Exception as e:
+                logger.debug(f"OBS legacy manual update failed: {e}")
+                
+            return False
+            
+        except Exception as e:
+            logger.debug(f"OBS legacy update failed: {e}")
+            return False
+    
+    def test_connection(self) -> Dict:
+        """Test OBS connection and return status info"""
+        if not self.connected:
+            self.connect()
+        
+        if not self.connected:
+            return {
+                "connected": False,
+                "error": "Could not connect to OBS"
+            }
+        
+        try:
+            # Get version and scene info
+            version_info = self.client.call(obswebsocket.requests.GetVersion())
+            
+            # Try to get current scene
+            try:
+                if self._is_websocket_v5_or_newer():
+                    scene_info = self.client.call(obswebsocket.requests.GetCurrentProgramScene())
+                    current_scene = scene_info.datain.get('currentProgramSceneName', 'Unknown')
+                else:
+                    scene_info = self.client.call(obswebsocket.requests.GetCurrentScene())
+                    current_scene = scene_info.datain.get('name', 'Unknown')
+            except Exception:
+                current_scene = "Unknown"
+            
+            return {
+                "connected": True,
+                "obs_version": self.obs_version,
+                "websocket_version": self.websocket_version,
+                "current_scene": current_scene,
+                "protocol_v5": self._is_websocket_v5_or_newer()
+            }
+            
+        except Exception as e:
+            return {
+                "connected": True,
+                "error": f"Connected but could not get info: {e}",
+                "obs_version": self.obs_version,
+                "websocket_version": self.websocket_version
+            }
+
 
 class DiscordManager:
     """Discord webhook integration"""
@@ -1204,6 +1551,20 @@ class TTSQueueSystem:
                 logger.error(f"Add donation error: {e}")
                 return jsonify({'status': 'error', 'message': str(e)}), 500
         
+        @self.app.route('/repair', methods=['POST'])
+        def repair_database():
+            """Repair database stats"""
+            try:
+                success = self.db.repair_stats_table()
+                if success:
+                    self.update_displays()
+                    return jsonify({'status': 'success', 'message': 'Database stats repaired'})
+                else:
+                    return jsonify({'status': 'error', 'message': 'Failed to repair database stats'}), 500
+            except Exception as e:
+                logger.error(f"Database repair error: {e}")
+                return jsonify({'status': 'error', 'message': str(e)}), 500
+
         @self.app.route('/process_next', methods=['POST'])
         def process_next():
             """Process next item in queue (Stream Deck button)"""
