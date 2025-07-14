@@ -1757,7 +1757,7 @@ class TTSQueueSystem:
                 return jsonify({'status': 'error', 'message': str(e)}), 500
       
 
-        @self.app.route('/repair', methods=['POST'])
+        @self.app.route('/api/repair', methods=['POST'])
         def repair_database():
             """Repair database stats"""
             try:
@@ -1794,6 +1794,128 @@ class TTSQueueSystem:
                 logger.error(f"Queue stats error: {e}")
                 return jsonify({'error': str(e)}), 500
     
+        @self.app.route('/api/test')
+        def test_api():
+            """Test API endpoint"""
+            return jsonify({
+                'status': 'success',
+                'message': 'API is working',
+                'timestamp': datetime.now().isoformat()
+            })
+        
+        @self.app.route('/api/services/status')
+        def get_services_status():
+            """Get status of all services"""
+            try:
+                # Check each service manually
+                obs_connected = getattr(self.obs, 'connected', False)
+                discord_enabled = getattr(self.discord, 'enabled', False)
+                discord_connected = discord_enabled  # Assume connected if enabled
+                tts_connected = True  # TTS is always available locally
+                
+                services = {
+                    'obs': {
+                        'status': 'connected' if obs_connected else 'failed',
+                        'connected': obs_connected,
+                        'error': None if obs_connected else 'Not connected to OBS'
+                    },
+                    'discord': {
+                        'status': 'connected' if discord_connected else 'disabled',
+                        'connected': discord_connected,
+                        'error': None if discord_enabled else 'Discord webhook not configured'
+                    },
+                    'tts': {
+                        'status': 'connected',
+                        'connected': tts_connected,
+                        'error': None
+                    }
+                }
+                
+                connected_count = sum(1 for s in services.values() if s['connected'])
+                
+                return jsonify({
+                    'status': 'success',
+                    'services': services,
+                    'initialization_complete': True,
+                    'connected_services': connected_count,
+                    'total_services': len(services)
+                })
+                
+            except Exception as e:
+                logger.error(f"Error getting services status: {e}")
+                return jsonify({
+                    'status': 'error', 
+                    'message': str(e),
+                    'services': {},
+                    'initialization_complete': True,
+                    'connected_services': 0,
+                    'total_services': 0
+                }), 500
+        
+        @self.app.route('/api/services/retry/<service_name>', methods=['POST'])
+        def retry_service(service_name):
+            """Retry connecting to a specific service"""
+            try:
+                if service_name == 'obs':
+                    try:
+                        self.obs.connect()
+                        success = getattr(self.obs, 'connected', False)
+                        if success:
+                            return jsonify({
+                                'status': 'success',
+                                'message': 'OBS connection retry successful'
+                            })
+                        else:
+                            return jsonify({
+                                'status': 'error',
+                                'message': 'OBS connection retry failed'
+                            }), 500
+                    except Exception as e:
+                        return jsonify({
+                            'status': 'error',
+                            'message': f'OBS retry error: {str(e)}'
+                        }), 500
+                        
+                elif service_name == 'discord':
+                    try:
+                        self.discord.connect()
+                        success = getattr(self.discord, 'connected', False)
+                        if success:
+                            return jsonify({
+                                'status': 'success',
+                                'message': 'Discord connection retry successful'
+                            })
+                        else:
+                            return jsonify({
+                                'status': 'error', 
+                                'message': 'Discord connection retry failed'
+                            }), 500
+                    except Exception as e:
+                        return jsonify({
+                            'status': 'error',
+                            'message': f'Discord retry error: {str(e)}'
+                        }), 500
+                        
+                elif service_name == 'tts':
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'TTS is always available'
+                    })
+                    
+                else:
+                    return jsonify({
+                        'status': 'error',
+                        'message': f'Unknown service: {service_name}'
+                    }), 404
+                    
+            except Exception as e:
+                logger.error(f"Retry service error: {e}")
+                return jsonify({
+                    'status': 'error', 
+                    'message': str(e)
+                }), 500
+
+
     def add_to_queue(self, username: str, message: str, amount: float) -> bool:
         """Add item to queue and update displays"""
         try:
