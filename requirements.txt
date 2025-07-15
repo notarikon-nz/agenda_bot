@@ -8,3 +8,6 @@ edge-tts
 asyncio 
 aiohttp
 pydub
+textual 
+httpx 
+rich

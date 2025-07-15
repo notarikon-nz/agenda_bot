@@ -33,13 +33,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import queue
+
 import tempfile
 import hashlib
 import aiohttp
 
 import obswebsocket # type: ignore
-import requests
+
 from discord_webhook import DiscordWebhook # type: ignore
 from flask import Flask, request, jsonify # type: ignore
 from gtts import gTTS # type: ignore
@@ -341,6 +341,59 @@ class DatabaseManager:
             logger.error(f"Error repairing stats table: {e}")
             return False
 
+    def skip_current_item(self) -> Tuple[bool, Dict]:
+        """Skip the current/next item in queue without playing TTS"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Get the next unprocessed item
+                cursor = conn.execute('''
+                    SELECT id, username, message, amount, timestamp
+                    FROM queue_items
+                    WHERE processed = FALSE
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                ''')
+                item = cursor.fetchone()
+                
+                if not item:
+                    return False, {"error": "No items in queue to skip"}
+                
+                item_id, username, message, amount, timestamp = item
+                
+                # Mark as processed but add skip flag
+                conn.execute('''
+                    UPDATE queue_items 
+                    SET processed = TRUE, 
+                        timestamp = timestamp || ' [SKIPPED]'
+                    WHERE id = ?
+                ''', (item_id,))
+                
+                # Update stats (count as processed but track as skipped)
+                conn.execute('''
+                    UPDATE queue_stats
+                    SET total_processed = total_processed + 1,
+                        total_amount = total_amount + ?,
+                        last_updated = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                ''', (amount,))
+                
+                conn.commit()
+                
+                skipped_item = {
+                    "id": item_id,
+                    "username": username,
+                    "message": message[:100] + "..." if len(message) > 100 else message,
+                    "amount": amount,
+                    "timestamp": timestamp
+                }
+                
+                logger.info(f"Skipped item: {username} - ${amount:.2f} - {message[:50]}...")
+                return True, {"skipped_item": skipped_item}
+                
+        except Exception as e:
+            logger.error(f"Error skipping item: {e}")
+            return False, {"error": str(e)}
+
     def reset_queue_counter(self) -> Tuple[bool, Dict]:
         """Reset queue counter to zero while preserving all messages and stats"""
         try:
@@ -481,6 +534,8 @@ class DatabaseManager:
             logger.error(f"Error repairing stats table: {e}")
             return False
 
+
+
 class TTSProvider(ABC):
     """Abstract base class for TTS providers"""
     
@@ -524,7 +579,7 @@ class EdgeTTSProvider(TTSProvider):
     def __init__(self, config: Dict):
         super().__init__(config)
         try:
-            import edge_tts
+            import edge_tts # type: ignore
             self.edge_tts = edge_tts
             self.available = True
         except ImportError:
@@ -876,7 +931,7 @@ class PollyTTSProvider(TTSProvider):
         
         if self.available:
             try:
-                import boto3
+                import boto3 # type: ignore
                 self.polly = boto3.client(
                     'polly',
                     region_name=self.region,
@@ -1741,8 +1796,7 @@ class TTSQueueSystem:
             except Exception as e:
                 logger.error(f"Reset counter error: {e}")
                 return jsonify({'status': 'error', 'message': str(e)}), 500
-        
- 
+
         @self.app.route('/api/reset-history', methods=['GET'])
         def get_reset_history():
             """Get history of queue resets"""
@@ -1755,7 +1809,6 @@ class TTSQueueSystem:
             except Exception as e:
                 logger.error(f"Reset history error: {e}")
                 return jsonify({'status': 'error', 'message': str(e)}), 500
-      
 
         @self.app.route('/api/repair', methods=['POST'])
         def repair_database():
@@ -1915,6 +1968,213 @@ class TTSQueueSystem:
                     'message': str(e)
                 }), 500
 
+        @self.app.route('/api/queue')
+        def get_detailed_queue():
+            """Get detailed queue information with pending and recent items"""
+            try:
+                with self.db.get_connection() if hasattr(self.db, 'get_connection') else sqlite3.connect(self.db.db_path) as conn:
+                    # Get pending items
+                    cursor = conn.execute('''
+                        SELECT id, username, message, amount, created_at
+                        FROM queue_items
+                        WHERE processed = FALSE
+                        ORDER BY created_at ASC
+                        LIMIT 50
+                    ''')
+                    
+                    pending_items = []
+                    for row in cursor.fetchall():
+                        pending_items.append({
+                            'id': row[0],
+                            'username': row[1],
+                            'message': row[2],
+                            'amount': row[3],
+                            'created_at': row[4]
+                        })
+                    
+                    # Get recent processed items
+                    cursor = conn.execute('''
+                        SELECT id, username, message, amount, timestamp
+                        FROM queue_items
+                        WHERE processed = TRUE
+                        ORDER BY id DESC
+                        LIMIT 20
+                    ''')
+                    
+                    recent_processed = []
+                    for row in cursor.fetchall():
+                        recent_processed.append({
+                            'id': row[0],
+                            'username': row[1],
+                            'message': row[2],
+                            'amount': row[3],
+                            'timestamp': row[4]
+                        })
+                    
+                    # Get stats
+                    stats = self.db.get_queue_stats()
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'pending': pending_items,
+                        'recent_processed': recent_processed,
+                        'stats': stats
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error getting detailed queue: {e}")
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e),
+                    'pending': [],
+                    'recent_processed': [],
+                    'stats': self.db.get_queue_stats()
+                }), 500
+        
+        @self.app.route('/api/health')
+        def get_system_health():
+            """Get system health information"""
+            try:
+                import psutil
+                import time
+                
+                # Calculate uptime (simple version)
+                if not hasattr(self, '_start_time'):
+                    self._start_time = time.time()
+                
+                uptime_seconds = time.time() - self._start_time
+                hours, remainder = divmod(uptime_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                uptime_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+                
+                # Get system metrics
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                memory_percent = psutil.virtual_memory().percent
+                
+                # Simple error tracking
+                error_count = getattr(self, '_error_count', 0)
+                
+                health_data = {
+                    'uptime': uptime_str,
+                    'error_count': error_count,
+                    'cpu_usage': [{'value': cpu_percent, 'timestamp': time.time()}],
+                    'memory_usage': [{'value': memory_percent, 'timestamp': time.time()}],
+                    'system_status': 'healthy' if cpu_percent < 80 and memory_percent < 80 else 'warning'
+                }
+                
+                return jsonify({
+                    'status': 'success',
+                    **health_data
+                })
+                
+            except ImportError:
+                # Fallback if psutil not available
+                import time
+                
+                if not hasattr(self, '_start_time'):
+                    self._start_time = time.time()
+                
+                uptime_seconds = time.time() - self._start_time
+                hours, remainder = divmod(uptime_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                uptime_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+                
+                return jsonify({
+                    'status': 'success',
+                    'uptime': uptime_str,
+                    'error_count': 0,
+                    'cpu_usage': [{'value': 0, 'timestamp': time.time()}],
+                    'memory_usage': [{'value': 0, 'timestamp': time.time()}],
+                    'system_status': 'unknown'
+                })
+                
+            except Exception as e:
+                logger.error(f"Error getting health data: {e}")
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e)
+                }), 500
+        
+        @self.app.route('/api/analytics')
+        def get_analytics():
+            """Get analytics data (simplified version)"""
+            try:
+                # Get basic analytics from database
+                with sqlite3.connect(self.db.db_path) as conn:
+                    # Daily trend (last 7 days)
+                    cursor = conn.execute('''
+                        SELECT DATE(created_at) as date, COUNT(*) as count, SUM(amount) as amount
+                        FROM queue_items
+                        WHERE created_at >= date('now', '-7 days')
+                        GROUP BY DATE(created_at)
+                        ORDER BY date
+                    ''')
+                    
+                    daily_trend = []
+                    for row in cursor.fetchall():
+                        daily_trend.append({
+                            'date': row[0],
+                            'count': row[1],
+                            'amount': row[2] or 0.0
+                        })
+                    
+                    # Hourly distribution
+                    cursor = conn.execute('''
+                        SELECT strftime('%H', created_at) as hour, COUNT(*) as count, SUM(amount) as amount
+                        FROM queue_items
+                        WHERE created_at >= datetime('now', '-1 day')
+                        GROUP BY hour
+                        ORDER BY hour
+                    ''')
+                    
+                    hourly_distribution = []
+                    for row in cursor.fetchall():
+                        hourly_distribution.append({
+                            'hour': int(row[0]) if row[0] else 0,
+                            'count': row[1],
+                            'amount': row[2] or 0.0
+                        })
+                    
+                    # Top donors
+                    cursor = conn.execute('''
+                        SELECT username, COUNT(*) as count, SUM(amount) as total_amount
+                        FROM queue_items
+                        WHERE created_at >= date('now', '-7 days')
+                        GROUP BY username
+                        ORDER BY total_amount DESC
+                        LIMIT 10
+                    ''')
+                    
+                    top_donors = []
+                    for row in cursor.fetchall():
+                        top_donors.append({
+                            'username': row[0],
+                            'count': row[1],
+                            'amount': row[2] or 0.0
+                        })
+                    
+                    analytics_data = {
+                        'daily_trend': daily_trend,
+                        'hourly_distribution': hourly_distribution,
+                        'top_donors': top_donors
+                    }
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'donations': analytics_data
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error getting analytics: {e}")
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e),
+                    'donations': {
+                        'daily_trend': [],
+                        'hourly_distribution': [],
+                        'top_donors': []
+                    }
+                }), 500
 
     def add_to_queue(self, username: str, message: str, amount: float) -> bool:
         """Add item to queue and update displays"""
